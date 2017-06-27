@@ -1,7 +1,8 @@
 #!/usr/bin/env python
+
 """
-A simple interface to download Sentinel-1 and Sentinel-2 datasets from
-the COPERNICUS Sentinel Hub.
+A simple interface to download Sentinel-1 and Sentinel-2 and
+Sentinel-3 datasets from the COPERNICUS Sentinel Hub.
 """
 from functools import partial
 import hashlib
@@ -10,6 +11,7 @@ import datetime
 import sys
 import xml.etree.cElementTree as ET
 import re
+import urllib2
 
 import requests
 from concurrent import futures
@@ -22,7 +24,7 @@ logging.getLogger("requests").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
 # hub_url = "https://scihub.copernicus.eu/dhus/search?q="
-hub_url = "https://scihub.copernicus.eu/apihub/search?q="
+# hub_url = "https://scihub.copernicus.eu/apihub/search?q="
 MGRS_CONVERT = "http://legallandconverter.com/cgi-bin/shopmgrs3.cgi"
 aws_url = 'http://sentinel-s2-l1c.s3.amazonaws.com/?delimiter=/&prefix=tiles/'
 aws_url_dload = 'http://sentinel-s2-l1c.s3.amazonaws.com/'
@@ -171,62 +173,83 @@ def parse_xml(xml):
     # for x in img.getchildren():
 
 
-def download_sentinel(location, input_start_date, input_sensor, output_dir,
-                      input_end_date=None, username="guest", password="guest"):
-    input_sensor = input_sensor.upper()
-    sensor_list = ["S1", "S2"]
-    if not input_sensor in sensor_list:
-        raise ValueError("Sensor can only be S1 or S2. You provided %s"
-                         % input_sensor)
+def download_sentinel(location, input_start_date, 
+                      input_plattform, output_dir,
+                      input_instrument = None, input_product_type = None,
+                      input_end_date = None,
+                      username="guest", password="guest"):
+
+    input_plattform = input_plattform.upper()
+    plattform_list = [ "S1", "S2", "S3" ]
+    if not input_plattform in plattform_list:
+        raise ValueError(" Plattform can only be S1, S2 or S3. You provided %s"
+                         % input_plattform )
     else:
-        if input_sensor.upper() == "S1":
-            sensor = "Sentinel-1"
-        elif input_sensor.upper() == "S2":
-            sensor = "Sentinel-2"
-        sensor_str = 'platformname:%s' % sensor
-        #sensor_str = 'filename:%s' % input_sensor.upper()
+        if input_plattform.upper() == "S1":
+            plattform = "Sentinel-1"
+            plattform_str = 'platformname:%s' % plattform
+
+        elif input_plattform.upper() == "S2":
+            plattform = "Sentinel-2"
+            plattform_str = 'platformname:%s' % plattform
+
+        elif input_plattform.upper() == "S3":
+            plattform = "Sentinel-3"
+            plattform_str = '( platformname:%s AND instrumentshortname:%s AND producttype:%s )' \
+                             % ( plattform, input_instrument, input_product_type )
+
+    # Day offset
+    offset = datetime.timedelta( hours = 23, minutes = 59)
     try:
-        start_date = datetime.datetime.strptime(input_start_date,
-                                                "%Y.%m.%d").isoformat()
+        start_date_ini = datetime.datetime.strptime(input_start_date, "%Y.%m.%d")
+
     except ValueError:
         try:
-            start_date = datetime.datetime.strptime(input_start_date,
-                                                    "%Y-%m-%d").isoformat()
+            start_date_ini = datetime.datetime.strptime(input_start_date, "%Y-%m-%d")
+
         except ValueError:
-            start_date = datetime.datetime.strptime(input_start_date,
-                                                    "%Y/%j").isoformat()
-    start_date = start_date + "Z"
+            start_date_ini = datetime.datetime.strptime(input_start_date, "%Y/%j")
+
+    start_date_end = start_date_ini + offset
+    str_start_date_ini = start_date_ini.isoformat() + "Z"
+    str_start_date_end = start_date_end.isoformat() + "Z"
 
     if input_end_date is None:
         end_date = "NOW"
     else:
         try:
-            end_date = datetime.datetime.strptime(input_end_date,
-                                                  "%Y.%m.%d").isoformat()
+            end_date_ini = datetime.datetime.strptime(input_end_date, "%Y.%m.%d")
+
         except ValueError:
             try:
-                end_date = datetime.datetime.strptime(input_end_date,
-                                                      "%Y-%m-%d").isoformat()
+                end_date_ini = datetime.datetime.strptime(input_end_date, "%Y-%m-%d")
+
             except ValueError:
-                end_date = datetime.datetime.strptime(input_end_date,
-                                                      "%Y/%j").isoformat()
+                end_date_ini = datetime.datetime.strptime(input_end_date, "%Y/%j")
+
+    end_date_end = end_date_ini + offset
+    str_end_date_ini = end_date_ini.isoformat() + "Z"
+    str_end_date_end = end_date_end.isoformat() + "Z"
 
     if len(location) == 2:
         location_str = 'footprint:"Intersects(%f, %f)"' % (location[0], location[1])
     elif len(location) == 4:
-        location_str = 'footprint:"Intersects( POLYGON(( " + \
-            "%f %f, %f %f, %f %f, %f %f, %f %f) ))"' % (
-            location[0], location[0],
-            location[0], location[1],
-            location[1], location[1],
+        location_str = '(footprint:"Intersects(POLYGON((' + \
+            '%f %f, %f %f, %f %f, %f %f, %f %f)))")' % (
             location[1], location[0],
-            location[0], location[0])
+            location[3], location[0],
+            location[3], location[2],
+            location[1], location[2],
+            location[1], location[0])
 
-    time_str = 'beginposition:[%s TO %s]' % (start_date, end_date)
+    time_str = '(beginPosition:[%s TO %s] AND endPosition:[%s TO %s])' % \
+                ( str_start_date_ini, str_end_date_end, \
+                  str_start_date_ini, str_end_date_end )
 
-    query = "%s AND %s AND %s" % (location_str, time_str, sensor_str)
+    query = "%s AND %s AND %s" % (location_str, time_str, plattform_str)
     query = "%s%s" % (hub_url, query)
-    # query = "%s%s" % ( hub_url, urllib2.quote(query ) )
+    escaped_query = "%s%s" % ( hub_url, urllib2.quote(query ) )
+
     LOG.debug(query)
     result = do_query(query, user=username, passwd=password)
     granules = parse_xml(result)
@@ -234,6 +257,7 @@ def download_sentinel(location, input_start_date, input_sensor, output_dir,
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
     ret_files = []
+
     for granule in granules:
         download_product(granule['link'] + "$value", os.path.join(output_dir,
                         granule['filename'].replace("SAFE", "zip")),
@@ -290,17 +314,12 @@ def aws_grabber(url, output_dir):
     return output_fname
 
 
-def download_sentinel_amazon(start_date, output_dir,
-                             tile=None,
-                             longitude=None, latitude=None,
+def download_sentinel_amazon(longitude, latitude, start_date, output_dir,
                              end_date=None, n_threads=15, just_previews=False,
                              verbose=False, clouds=None):
     """A method to download data from the Amazon cloud """
     # First, we get hold of the MGRS reference...
-    if tile is None:
-        mgrs_reference = get_mgrs(longitude, latitude)
-    else:
-        mgrs_reference = tile
+    mgrs_reference = get_mgrs(longitude, latitude)
     if verbose:
         print "We need MGRS reference %s" % mgrs_reference
     utm_code = mgrs_reference[:2]
@@ -374,21 +393,84 @@ if __name__ == "__main__":    # location = (43.3650, -8.4100)
     # output_dir = "/data/selene/ucfajlg/tmp/"
     # granules, retfiles = download_sentinel ( location, input_start_date,
     # input_sensor, output_dir )
-    lng = -8.4100
-    lat = 43.3650
+
+    #lng = -8.4100
+    #lat = 43.3650
     #lat = 39.0985 # Barrax
     #lng = -2.1082 
     #lat = 28.55 # Libya 4
     #lng = 23.39
-    print "Testing S2 on AWS..."
-    download_sentinel_amazon(lat, lng, datetime.datetime(2016, 1, 11),
-                             "/tmp/", end_date=datetime.datetime(2016, 12, 25),
-                             clouds=10)
-    #print "Testing S2 on COPERNICUS scientific hub"
-    #location=(lat,lng)
-    #input_start_date="2017.1.11"
-    #input_sensor="S2"
-    #output_dir="/tmp/"
-    #print "Set username and password variables for Sentinel hub!!!"
-    #download_sentinel(location, input_start_date, input_sensor, output_dir,
-                      #input_end_date=None, username, password)
+    # print "Testing S2 on AWS..."
+    # download_sentinel_amazon(lat, lng, datetime.datetime(2016, 1, 11),
+    #                         "/tmp/", end_date=datetime.datetime(2016, 12, 25),
+    #                         clouds=10)
+
+    # print "Testing S2 on COPERNICUS scientific hub"
+    # location=(lat,lng)
+    # input_start_date="2017.1.11"
+    # input_plattform="S2"
+    # output_dir="/tmp/"
+    # print "Set username and password variables for Sentinel hub!!!"
+    # download_sentinel(location, input_start_date, input_plattform, output_dir,
+    #                   input_instrument=None, input_end_date=None, 
+    #                   username=None, password=None)
+
+    # ======================
+    # GLS -- Sentinel-3 OLCI
+    # ======================
+
+    #print "Test S3 data download on the COPERNICUS scientifuc hub"
+    #hub_url = "https://scihub.copernicus.eu/s3/search?q="
+
+    #llc_lat, llc_lng = 38.94, -7.58
+    #urc_lat, urc_lng = 40.51, -5.58
+
+    #location = ( llc_lat, llc_lng, urc_lat, urc_lng )
+    #username, password = 's3guest', 's3guest'
+
+    #input_start_date = "2017.5.1"
+    #input_end_date = "2017.5.3"
+
+    #input_plattform = "S3"
+    #input_instrument = "OLCI"
+
+    # https://sentinel.esa.int/web/sentinel/user-guides/sentinel-3-olci/data-formats
+    # OL_1_EFR Full resolution top of atmosphere reflectance
+    #input_product_type = "OL_1_EFR___"
+
+    #output_dir = "/tmp"
+
+    #download_sentinel( location, input_start_date, input_plattform,
+    #                   output_dir, input_instrument, input_product_type,
+    #                   input_end_date, username, password )
+
+    # ========================
+    # GLS -- Sentinel-3  SLSTR
+    # ========================
+
+    print "Test S3 data download on the COPERNICUS scientifuc hub"
+    hub_url = "https://scihub.copernicus.eu/s3/search?q="
+
+    llc_lat, llc_lng = 38.94, -7.58
+    urc_lat, urc_lng = 40.51, -5.58
+
+    location = ( llc_lat, llc_lng, urc_lat, urc_lng )
+    username, password = 's3guest', 's3guest'
+
+    input_start_date = "2017.5.1"
+    input_end_date = "2017.5.3"
+
+    input_plattform = "S3"
+    input_instrument = "SLSTR"
+
+    # https://sentinel.esa.int/web/sentinel/user-guides/sentinel-3-slstr/data-formats
+    # SL_1_RBT___ Brightness temperatures and radiances 
+    input_product_type = "SL_1_RBT___"
+
+    output_dir = "/tmp"
+
+    download_sentinel( location, input_start_date, input_plattform,
+                       output_dir, input_instrument, input_product_type,
+                       input_end_date, username, password )
+
+
